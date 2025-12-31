@@ -5,7 +5,7 @@ import rasterio
 from rasterio.windows import Window
 from rasterio.transform import xy
 from itertools import product
-from ultralytics import SAM
+from ultralytics.models.sam.predict import SAM3SemanticPredictor
 import matplotlib.pyplot as plt
 import random
 import yaml
@@ -16,6 +16,8 @@ import json
 from pyproj import Transformer
 import base64
 from io import BytesIO
+from PIL import Image
+from tqdm import tqdm  # Progress bar
 
 # --- Configuration ---
 IMAGE_PATH = "./mosiac_rgb_6cmPerPixel.tif"
@@ -85,9 +87,15 @@ def main():
     
     # Initialize models
     print("Loading models...")
-    # detection_model = YOLOWorld("yolov8s-world.pt") # Unused
-    # detection_model.set_classes(CLASSES) # Unused
-    segmentation_model = SAM("sam2_t.pt")
+    # Initialize SAM3 predictor with configuration
+    overrides = dict(
+        conf=0.25,              # confidence threshold
+        task="segment",         # task i.e. segment
+        mode="predict",         # mode i.e. predict
+        model="SAM3/sam3.pt",   # model file = sam3.pt
+        half=True,              # Use FP16 for faster inference on GPU.
+    )
+    predictor = SAM3SemanticPredictor(overrides=overrides)
     
     # Store all found polygons for the map
     all_map_polygons = []
@@ -120,31 +128,15 @@ def main():
             print(f"DEBUG MODE: Processing only {len(DEBUG_TILES)} specific tiles...")
             tile_indices = DEBUG_TILES
         else:
-            # Sample 10% but INCLUDE debug tiles to ensure we get some results
-            all_indices = list(product(range(0, W, TILE_SIZE), range(0, H, TILE_SIZE)))
-            all_indices_set = set(all_indices)
-            
-            # Remove debug tiles from pool to avoid dups
-            for dt in DEBUG_TILES:
-                if dt in all_indices_set:
-                    all_indices_set.remove(dt)
-            
-            sample_size = max(1, int(len(all_indices) * 0.10))
-            # Ensure sample_size does not exceed the number of available non-debug tiles
-            sample_size = min(sample_size, len(all_indices_set))
-            random_sample = random.sample(list(all_indices_set), sample_size)
-            
-            # Limit to 10 tiles total for rapid verify
-            MAX_TILES = 10
-            
-            # Combine
-            tile_indices = DEBUG_TILES + random_sample
-            tile_indices = tile_indices[:MAX_TILES] # Hard clip
-            print(f"Sampling LIMITED to {len(tile_indices)} tiles (User Request)")
+            # USE ALL TILES (Full Run)
+            tile_indices = list(product(range(0, W, TILE_SIZE), range(0, H, TILE_SIZE)))
+            print(f"Starting FULL RUN on {len(tile_indices)} tiles...")
         
         processed_count = 0
         
-        for min_processed, (col_off, row_off) in enumerate(tile_indices):
+        # --- PROCESS TILES WITH PROGRESS BAR ---
+        # Using tqdm to show progress for the long running task
+        for min_processed, (col_off, row_off) in enumerate(tqdm(tile_indices, desc="Processing Tiles", unit="tile")):
             window = Window(col_off, row_off, min(TILE_SIZE, W - col_off), min(TILE_SIZE, H - row_off))
             
             # SKIP if already done
@@ -217,17 +209,18 @@ def main():
 
 
             # Print progress every tile to confirm liveness
-            print(f"Scanning tile {min_processed+1}/{len(tile_indices)}: {col_off}_{row_off}...", end="\r", flush=True)
+            # Print progress every tile to confirm liveness (superseded by tqdm but kept for log files)
+            # print(f"Scanning tile {min_processed+1}/{len(tile_indices)}: {col_off}_{row_off}...", end="\r", flush=True)
 
             window = Window(col_off, row_off, min(TILE_SIZE, W - col_off), min(TILE_SIZE, H - row_off))
             
             # Read tile
             tile_data = src.read(window=window)
             if tile_data.shape[0] == 3: # Check for 3 channels (RGB)
-                 tile_img = np.moveaxis(tile_data, 0, -1) # (C, H, W) -> (H, W, C)
+                 tile_img = np.ascontiguousarray(np.moveaxis(tile_data, 0, -1)) # (C, H, W) -> (H, W, C)
             else:
                  # Handle cases with alpha channel or other formats if necessary, assuming first 3 are RGB
-                 tile_img = np.moveaxis(tile_data[:3, :, :], 0, -1)
+                 tile_img = np.ascontiguousarray(np.moveaxis(tile_data[:3, :, :], 0, -1))
 
             # Skip empty/black tiles
             if tile_img.max() == 0:
@@ -244,98 +237,47 @@ def main():
             if tile_img.shape[2] != 3:
                  continue
                  
-            # -- NEW PIPELINE: SAM Auto-Segment + CLIP Filter -- 
+            # -- NEW PIPELINE: SAM3 Text Prompt --
             
-            # 1. Run SAM in Auto Mode (No prompts)
+            # Set image for inference
+            try:
+                predictor.set_image(tile_img)
+            except Exception as e:
+                print(f"Error setting image for {col_off}_{row_off}: {e}")
+                continue
+
+            # Run inference
             import time
             t0 = time.time()
-            sam_results = segmentation_model(tile_img, verbose=False)
+            results = predictor(text=["sidewalk"], save=False)
             t1 = time.time()
-            print(f"SAM took {t1-t0:.2f}s for {col_off}_{row_off}")
+            # print(f"SAM3 took {t1-t0:.2f}s")
             
-            final_mask = np.zeros((window.height, window.width), dtype=np.uint8)
             labels = [] # YOLO labels
             
-            # Prepare CLIP
-            import torch
-            import clip
-            from PIL import Image
-            
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if 'clip_model' not in globals():
-                global clip_model, clip_preprocess
-                print("Loading CLIP model...")
-                clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
-            
-            text_inputs = torch.cat([clip.tokenize(f"a photo of a {c}") for c in ["sidewalk", "pavement", "walkway", "ground", "road", "building", "dirt"]]).to(device)
-            positive_indices = [0, 1, 2]
-            
-            if len(sam_results) > 0 and sam_results[0].masks is not None:
-                masks = sam_results[0].masks.data.cpu().numpy().astype('uint8') # (N, H, W)
+            if results and results[0].masks is not None:
+                # masks.xy gives us the polygons directly
+                polygons = results[0].masks.xy 
                 
-                # Check for SAM issue where it returns massive number of masks
-                if len(masks) > 300: 
-                    # Optimization: Likely too cluttered or noise, skip or limit?
-                    # For now proceed but it might be slow.
-                    pass 
-
-                for i, m in enumerate(masks):
-                    if m.sum() < 100: continue
-
-                    y_indices, x_indices = np.where(m)
-                    y_min, y_max = y_indices.min(), y_indices.max()
-                    x_min, x_max = x_indices.min(), x_indices.max()
+                for poly in polygons:
+                    if len(poly) < 3: continue
                     
-                    h_crop, w_crop = y_max - y_min, x_max - x_min
-                    if h_crop < 10 or w_crop < 10: continue
+                    # 1. YOLO Format (Normalized relative to tile)
+                    norm_poly = normalize_polygon(poly, window.width, window.height)
+                    labels.append(f"0 {' '.join(map(str, norm_poly))}")
                     
-                    crop = tile_img[y_min:y_max+1, x_min:x_max+1]
-                    pil_img = Image.fromarray(crop)
-                    image_input = clip_preprocess(pil_img).unsqueeze(0).to(device)
+                    # 2. Map Format (Global Lat/Lon)
+                    global_pixels = poly + [col_off, row_off]
                     
-                    with torch.no_grad():
-                        image_features = clip_model.encode_image(image_input)
-                        text_features = clip_model.encode_text(text_inputs)
-                        image_features /= image_features.norm(dim=-1, keepdim=True)
-                        text_features /= text_features.norm(dim=-1, keepdim=True)
-                        similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-                        probs = similarity[0].cpu().numpy()
+                    rows = global_pixels[:, 1]
+                    cols = global_pixels[:, 0]
+                    xs, ys = rasterio.transform.xy(transform, rows, cols, offset='center')
                     
-                    top_class_idx = probs.argmax()
-                    score = probs[top_class_idx]
-                    
-                    if top_class_idx in positive_indices and score > 0.3: # Lowered to 0.3
-                        final_mask = np.maximum(final_mask, m)
-                         
-                        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        for contour in contours:
-                             if contour.size >= 6:
-                                 # 1. YOLO Format (Normalized relative to tile)
-                                 norm_poly = normalize_polygon(contour.reshape(-1, 2), window.width, window.height)
-                                 labels.append(f"0 {' '.join(map(str, norm_poly))}")
-                                 
-                                 # 2. Map Format (Global Lat/Lon)
-                                 # Contour points: (x, y) relative to tile
-                                 # Global pixel: (col_off + x, row_off + y)
-                                 global_pixels = contour.reshape(-1, 2) + [col_off, row_off]
-                                 
-                                 # Rasterio transform expects (rows, cols) -> (y, x) for pixels?
-                                 # transform * (col, row) -> (x, y) [Projected Coords]
-                                 # src.xy(row, col) -> (x, y)
-                                 
-                                 # Convert all points
-                                 # Note: src.xy takes list of rows, list of cols
-                                 rows = global_pixels[:, 1]
-                                 cols = global_pixels[:, 0]
-                                 xs, ys = rasterio.transform.xy(transform, rows, cols, offset='center')
-                                 
-                                 # Project to Lat/Lon for Map
-                                 if transformer:
-                                     lons, lats = transformer.transform(xs, ys)
-                                     all_map_polygons.append(list(zip(lats, lons)))
-                                 else:
-                                     all_map_polygons.append(list(zip(ys, xs)))
-
+                    if transformer:
+                        lons, lats = transformer.transform(xs, ys)
+                        all_map_polygons.append(list(zip(lats, lons)))
+                    else:
+                        all_map_polygons.append(list(zip(ys, xs)))
 
             # 4. Save Data (Only if labels found)
             if len(labels) > 0:
@@ -355,7 +297,7 @@ def main():
                 # Add to map overlays
                 pil_img = Image.fromarray(tile_img)
                 buff = BytesIO()
-                pil_img.save(buff, format="JPEG")
+                pil_img.save(buff, format="JPEG", quality=95)
                 b64_data = base64.b64encode(buff.getvalue()).decode('utf-8')
                 img_src = f"data:image/jpeg;base64,{b64_data}"
                 
@@ -417,9 +359,49 @@ def main():
         else:
              center = [0, 0] # Fallback
              
-        m = folium.Map(location=center, zoom_start=18, tiles='CartoDB positron')
+        m = folium.Map(
+            location=center, 
+            zoom_start=19, 
+            max_zoom=28, 
+            tiles=None
+        )
+        folium.TileLayer(
+            'CartoDB positron', 
+            max_zoom=28, 
+            max_native_zoom=19,
+            name='CartoDB Positron'
+        ).add_to(m)
         
-        # Add Sidewalks (Green)
+        # --- Layer Groups ---
+        fg_imagery = folium.FeatureGroup(name="Satellite Imagery", show=True)
+        fg_sidewalks = folium.FeatureGroup(name="Sidewalks (Detected)", show=True)
+        fg_streets = folium.FeatureGroup(name="OSM Streets", show=True)
+        fg_aoi = folium.FeatureGroup(name="AOI Boundary", show=True)
+
+        # 1. AOI BBox (Total Image Extent)
+        if transformer:
+             with rasterio.open(IMAGE_PATH) as s:
+                 l, b, r, t = s.bounds
+                 # Points: BL, TL, TR, BR
+                 # transform(x, y) -> (lon, lat)
+                 # We need (lat, lon) for folium
+                 corners_x = [l, l, r, r, l]
+                 corners_y = [b, t, t, b, b]
+                 
+                 aoi_latlons = []
+                 for x, y in zip(corners_x, corners_y):
+                     lon, lat = transformer.transform(x, y)
+                     aoi_latlons.append([lat, lon])
+                 
+                 folium.PolyLine(
+                     aoi_latlons,
+                     color="blue",
+                     weight=4,
+                     opacity=1.0,
+                     popup="AOI Boundary"
+                 ).add_to(fg_aoi)
+
+        # 2. Add Sidewalks
         for poly_points in all_map_polygons:
             folium.Polygon(
                 locations=poly_points,
@@ -427,29 +409,28 @@ def main():
                 weight=2,
                 fill_opacity=0.4,
                 popup="Sidewalk"
-            ).add_to(m)
+            ).add_to(fg_sidewalks)
 
-        # Add Image Overlays
+        # 3. Add Image Overlays
         print(f"Adding {len(map_overlays)} image overlays...")
         for img_src, bounds in map_overlays:
+            # Note: ImageOverlay doesn't strictly support adding to FeatureGroup in all versions, 
+            # but it should work. Note: It might need to be added to map directly or macro element.
+            # Let's try adding to FG.
             folium.raster_layers.ImageOverlay(
                 image=img_src,
                 bounds=bounds,
-                opacity=0.6,
-                name="Satellite Imagery"
-            ).add_to(m)
+                opacity=1.0, # High opacity for visibility, user can toggle
+                name="Satellite Tile"
+            ).add_to(fg_imagery)
 
-        # Add OSM Streets (Red)
+        # 4. Add OSM Streets
         if transformer:
-             # Calculate bounds for Overpass
              with rasterio.open(IMAGE_PATH) as s:
                  l, b, r, t = s.bounds
-                 # Reproject bounds
-                 # transform(x, y) -> (lon, lat)
                  lon_min, lat_min = transformer.transform(l, b)
                  lon_max, lat_max = transformer.transform(r, t)
                  
-                 # Ensure min/max correct
                  min_lat, max_lat = min(lat_min, lat_max), max(lat_min, lat_max)
                  min_lon, max_lon = min(lon_min, lon_max), max(lon_min, lon_max)
                  
@@ -460,7 +441,6 @@ def main():
                      print(f"Found {len(osm_data['elements'])} street segments.")
                      for element in osm_data['elements']:
                          if element['type'] == 'way' and 'geometry' in element:
-                             # Extract points (lat, lon)
                              line_points = [[pt['lat'], pt['lon']] for pt in element['geometry']]
                              folium.PolyLine(
                                  line_points, 
@@ -468,11 +448,19 @@ def main():
                                  weight=2, 
                                  opacity=0.7,
                                  popup=f"Street: {element.get('tags', {}).get('name', 'unnamed')}"
-                             ).add_to(m)
+                             ).add_to(fg_streets)
+
+        # Add Groups to Map
+        fg_imagery.add_to(m)
+        fg_sidewalks.add_to(m)
+        fg_streets.add_to(m)
+        fg_aoi.add_to(m)
 
         # Add base layers
         folium.TileLayer('openstreetmap').add_to(m)
-        folium.LayerControl().add_to(m)
+        
+        # Layer Control
+        folium.LayerControl(collapsed=False).add_to(m)
 
         map_path = "sidewalk_map_full.html"
         m.save(map_path)

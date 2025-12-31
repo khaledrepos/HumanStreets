@@ -88,6 +88,17 @@ def main():
     all_masks = results[0].masks.data.cpu().numpy()
     print(f"Total Segments Found: {len(all_masks)}")
 
+    # Debug: Save ALL masks to see if Sidewalk even exists
+    print(f"Debug: Saving 'debug_all_masks.jpg' with {len(all_masks)} segments...")
+    debug_overlay = img_rgb.copy()
+    for i, m in enumerate(all_masks):
+        np.random.seed(i)
+        color = np.random.randint(0, 255, 3)
+        debug_overlay[m.astype(bool)] = debug_overlay[m.astype(bool)] * 0.5 + color * 0.5
+    cv2.imwrite("debug_all_masks.jpg", cv2.cvtColor(debug_overlay, cv2.COLOR_RGB2BGR))
+    
+    final_masks = all_masks # Fallback
+
     # --- STEP 4: FILTERING (Optional) ---
     final_masks = []
     
@@ -95,13 +106,15 @@ def main():
         print(f"\n--- STEP 3: FILTERING for '{args.specific}' ---")
         filter_start = time.time()
         
-        # Prepare Batch for CLIP (Faster than loop)
-        # For simplicity in this demo, we loop but optimize the display
+        # Enhanced Negative Prompts
+        negatives = ["background", "noise", "other objects", "car", "vehicle", "tree", "bush", "house", "building", "road", "asphalt"]
+        labels = [args.specific] + negatives
+        print(f"Labels: {labels}")
+        
         count = 0 
         for i, mask in enumerate(all_masks):
-            if mask.sum() < 500: continue # Skip noise
+            if mask.sum() < 500: continue 
             
-            # Crop
             y, x = np.where(mask > 0)
             if len(y) == 0: continue
             y1, y2, x1, x2 = y.min(), y.max(), x.min(), x.max()
@@ -110,7 +123,7 @@ def main():
             
             # CLIP Inference
             inputs = clip_processor(
-                text=[args.specific, "background", "noise", "other objects"], 
+                text=labels, 
                 images=pil_crop, 
                 return_tensors="pt", 
                 padding=True
@@ -119,16 +132,22 @@ def main():
             with torch.no_grad():
                 outputs = clip_model(**inputs)
                 probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
-                
-            if probs[0] > CONFIDENCE_THRESHOLD:
+            
+            # Index 0 is result
+            score = probs[0]
+            top_idx = probs.argmax()
+            top_label = labels[top_idx]
+            
+            # DEBUG PRINT
+            if score > 0.1: # Print anything remotely close
+                print(f"Mask {i}: {score:.3f} for '{args.specific}' | Top: '{top_label}' ({probs[top_idx]:.3f})")
+
+            if score > CONFIDENCE_THRESHOLD and top_label == args.specific:
                 final_masks.append(mask)
             
             if i % 10 == 0: print(f"Classifying {i}/{len(all_masks)}...", end='\r')
             
         print(f"Filtering took {time.time() - filter_start:.2f}s. Matches: {len(final_masks)}")
-    else:
-        # If no specific target, show everything
-        final_masks = all_masks
 
     # --- STEP 5: VISUALIZE ---
     plt.figure(figsize=(12, 12))
@@ -136,23 +155,26 @@ def main():
     
     if len(final_masks) > 0:
         # Create colorful mask for "everything", or single color for "specific"
-        overlay = np.zeros_like(img_rgb)
-        alpha_map = np.zeros(img_rgb.shape[:2], dtype=float)
+        # MANUAL BLENDING (More Robust)
+        print("Blending masks into image...")
+        blended_img = img_rgb.copy().astype(float)
         
         sorted_masks = sorted(final_masks, key=lambda x: x.sum(), reverse=True)
         
         for i, m in enumerate(sorted_masks):
             if args.specific:
-                color = [0, 255, 0] # All Green for target
+                color = np.array([0, 255, 0]) # Green
             else:
-                np.random.seed(i) # Consistent random colors
+                np.random.seed(i)
                 color = np.random.randint(0, 255, 3)
                 
             m_bool = m.astype(bool)
-            overlay[m_bool] = color
-            alpha_map[m_bool] = 0.5
+            print(f" - Mask {i}: {m_bool.sum()} pixels.")
             
-        plt.imshow(overlay, alpha=alpha_map[:, :, None])
+            # Simple alpha blend: 0.6*Image + 0.4*Color
+            blended_img[m_bool] = blended_img[m_bool] * 0.6 + color * 0.4
+            
+        plt.imshow(blended_img.astype(np.uint8))
         title = f"Prompt: '{args.specific}'" if args.specific else "Segment Everything"
         plt.title(f"{title}\nTime: {duration:.2f}s | Count: {len(final_masks)}")
     
