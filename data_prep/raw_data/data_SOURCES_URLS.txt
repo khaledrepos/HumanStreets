@@ -1,0 +1,6 @@
+https://map.openaerialmap.org/#/-86.495361328125,40.455307212131494,6/square/03200010/5ce6ccdfb8224e000733626e?resolution=high&_k=jg25e6
+
+https://map.openaerialmap.org/#/-73.92803728580475,40.763641245521754,17/square/0320101101321301110/59e62b9b3d6412ef7220a5b7?_k=u4rw8y
+
+
+https://map.openaerialmap.org/#/-120.9814453125,38.85682013474361,4/square/023010/67aadf16f0bc0e6f2ff66f78?resolution=high&_k=hzsyte
