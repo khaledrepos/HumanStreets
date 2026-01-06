@@ -3,3 +3,5 @@ uvicorn
 transformers
 torch
 accelerate
+psycopg2-binary
+peft
